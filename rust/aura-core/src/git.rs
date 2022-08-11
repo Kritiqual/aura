@@ -1,23 +1,27 @@
 //! Generalized `git` interaction.
 
+use crate::Apply;
+use from_variants::FromVariants;
 use log::debug;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// A git-related error.
+#[derive(Debug, FromVariants)]
 pub enum Error {
     /// Some IO action failed.
     Io(std::io::Error),
     /// A git clone failed.
+    #[from_variants(skip)]
     Clone(PathBuf),
     /// A git pull failed.
+    #[from_variants(skip)]
     Pull(PathBuf),
-}
-
-impl From<std::io::Error> for Error {
-    fn from(v: std::io::Error) -> Self {
-        Self::Io(v)
-    }
+    /// A git diff failed.
+    #[from_variants(skip)]
+    Diff(PathBuf),
+    /// Converting a git hash to a Rust string failed.
+    ReadHash(std::string::FromUtf8Error),
 }
 
 impl std::fmt::Display for Error {
@@ -26,6 +30,8 @@ impl std::fmt::Display for Error {
             Error::Io(e) => write!(f, "{}", e),
             Error::Clone(p) => write!(f, "A git clone failed: {}", p.display()),
             Error::Pull(p) => write!(f, "A git pull failed: {}", p.display()),
+            Error::ReadHash(e) => write!(f, "Reading a git hash into Rust failed: {e}"),
+            Error::Diff(p) => write!(f, "A git diff failed: {}", p.display()),
         }
     }
 }
@@ -68,4 +74,33 @@ pub fn pull(dir: &Path) -> Result<(), Error> {
         .success()
         .then(|| ())
         .ok_or_else(|| Error::Pull(dir.to_path_buf()))
+}
+
+/// Given a `Path` to a known local git repo, find out the hash of its latest
+/// commit.
+pub fn hash(dir: &Path) -> Result<String, Error> {
+    debug!("git rev-parse: {}", dir.display());
+
+    Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .current_dir(dir)
+        .output()?
+        .stdout
+        .apply(String::from_utf8)
+        .map_err(Error::ReadHash)
+}
+
+/// Display the diff between `master` and a given hash.
+pub fn diff(dir: &Path, hash: &str) -> Result<(), Error> {
+    debug!("git diff: {}", dir.display());
+
+    Command::new("git")
+        .arg("diff")
+        .arg(hash)
+        .current_dir(dir)
+        .status()?
+        .success()
+        .then(|| ())
+        .ok_or_else(|| Error::Diff(dir.to_path_buf()))
 }

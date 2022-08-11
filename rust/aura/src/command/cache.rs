@@ -1,22 +1,28 @@
 //! All functionality involving the `-C` command.
 
 use crate::download::download_with_progress;
-use crate::{a, aura, green, red, yellow};
+use crate::env::Env;
+use crate::error::Nested;
+use crate::localization::Localised;
+use crate::utils::{PathStr, NOTHING};
+use crate::{aura, green, proceed, yellow};
 use alpm::Alpm;
 use aura_core::cache::{CacheSize, PkgPath};
-use chrono::{DateTime, Local};
 use colored::*;
+use from_variants::FromVariants;
 use i18n_embed::{fluent::FluentLanguageLoader, LanguageLoader};
 use i18n_embed_fl::fl;
 use itertools::Itertools;
 use linya::Progress;
-use log::debug;
+use log::{debug, error};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use time::macros::format_description;
+use time::OffsetDateTime;
 use ubyte::ToByteUnit;
 
 const FIFTY_MB: i64 = 52_428_800;
@@ -26,50 +32,65 @@ const FIVE_HUNDRED_MB: i64 = 524_288_000;
 /// The date where Arch Linux switched compression schemes from XZ to ZSTD.
 const CMPR_SWITCH: i64 = 1_577_404_800;
 
-pub enum Error {
-    Io(std::io::Error),
+#[derive(FromVariants)]
+pub(crate) enum Error {
     Readline(rustyline::error::ReadlineError),
     Sudo(crate::utils::SudoError),
     Pacman(crate::pacman::Error),
     Cancelled,
-    MiscShell,
-    Silent,
+    NoPackages,
+    NothingToDo,
+    #[from_variants(skip)]
+    AlreadyExists(PathBuf),
+    #[from_variants(skip)]
+    Delete(PathBuf),
+    #[from_variants(skip)]
+    ReadDir(PathBuf),
+    #[from_variants(skip)]
+    Stdout(std::io::Error),
+    #[from_variants(skip)]
+    CurrDir(std::io::Error),
+    #[from_variants(skip)]
+    Mkdir(PathBuf, std::io::Error),
+    Date(time::error::Format),
 }
 
-impl From<crate::pacman::Error> for Error {
-    fn from(v: crate::pacman::Error) -> Self {
-        Self::Pacman(v)
-    }
-}
-
-impl From<crate::utils::SudoError> for Error {
-    fn from(v: crate::utils::SudoError) -> Self {
-        Self::Sudo(v)
-    }
-}
-
-impl From<rustyline::error::ReadlineError> for Error {
-    fn from(v: rustyline::error::ReadlineError) -> Self {
-        Self::Readline(v)
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(v: std::io::Error) -> Self {
-        Self::Io(v)
-    }
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Nested for Error {
+    fn nested(&self) {
         match self {
-            Error::Io(e) => write!(f, "{}", e),
-            Error::Readline(e) => write!(f, "{}", e),
-            Error::Sudo(e) => write!(f, "{}", e),
-            Error::Pacman(e) => write!(f, "{}", e),
-            Error::MiscShell => write!(f, "A miscellaneous shell call failed."),
-            Error::Silent => write!(f, ""),
-            Error::Cancelled => write!(f, "Action cancelled."),
+            Error::Readline(e) => error!("{e}"),
+            Error::Sudo(e) => e.nested(),
+            Error::Pacman(e) => e.nested(),
+            Error::Cancelled => {}
+            Error::NoPackages => {}
+            Error::NothingToDo => {}
+            Error::AlreadyExists(_) => {}
+            Error::Delete(_) => {}
+            Error::ReadDir(_) => {}
+            Error::Stdout(e) => error!("{e}"),
+            Error::CurrDir(e) => error!("{e}"),
+            Error::Mkdir(_, e) => error!("{e}"),
+            Error::Date(e) => error!("{e}"),
+        }
+    }
+}
+
+impl Localised for Error {
+    fn localise(&self, fll: &FluentLanguageLoader) -> String {
+        match self {
+            Error::Readline(_) => fl!(fll, "err-user-input"),
+            Error::Sudo(e) => e.localise(fll),
+            Error::Pacman(e) => e.localise(fll),
+            Error::Cancelled => fl!(fll, "common-cancelled"),
+            Error::NoPackages => fl!(fll, "common-no-packages"),
+            Error::NothingToDo => fl!(fll, "common-no-work"),
+            Error::AlreadyExists(p) => fl!(fll, "C-b-file", target = p.utf8()),
+            Error::Delete(p) => fl!(fll, "err-file-del", file = p.utf8()),
+            Error::ReadDir(p) => fl!(fll, "err-read-dir", dir = p.utf8()),
+            Error::Stdout(_) => fl!(fll, "err-write"),
+            Error::CurrDir(_) => fl!(fll, "C-b-curr"),
+            Error::Mkdir(p, _) => fl!(fll, "dir-mkdir", dir = p.utf8()),
+            Error::Date(_) => fl!(fll, "err-time-format"),
         }
     }
 }
@@ -82,11 +103,8 @@ pub(crate) fn downgrade(
 ) -> Result<(), Error> {
     // Exit early if the user passed no packages.
     if packages.is_empty() {
-        red!(fll, "common-no-packages");
-        return Err(Error::Silent);
+        return Err(Error::NoPackages);
     }
-
-    crate::utils::sudo()?;
 
     // --- All tarball paths for packages the user asked for --- //
     let mut tarballs: HashMap<&str, Vec<PkgPath>> = HashMap::new();
@@ -97,22 +115,18 @@ pub(crate) fn downgrade(
         }
     }
 
-    let mut to_downgrade: Vec<OsString> = packages
+    let to_downgrade: Vec<OsString> = packages
         .iter()
         .filter_map(|p| tarballs.remove(p.as_str()).map(|pps| (p, pps)))
-        .filter_map(|(p, pps)| downgrade_one(fll, &p, pps).ok())
+        .filter_map(|(p, pps)| downgrade_one(fll, p, pps).ok())
         .map(|pp| pp.into_pathbuf().into_os_string())
         .collect();
 
     if to_downgrade.is_empty() {
-        red!(fll, "common-no-work");
-        return Err(Error::Silent);
+        return Err(Error::NothingToDo);
     }
 
-    to_downgrade.push(OsStr::new("-U").to_os_string());
-    to_downgrade.reverse();
-
-    crate::pacman::pacman(to_downgrade)?;
+    crate::pacman::sudo_pacman("-U", NOTHING, to_downgrade)?;
     green!(fll, "common-done");
     Ok(())
 }
@@ -162,9 +176,10 @@ pub(crate) fn invalid(
 /// Print the contents of the package caches.
 pub(crate) fn list(caches: &[&Path]) -> Result<(), Error> {
     for path in caches {
-        for de in path.read_dir()?.filter_map(|de| de.ok()) {
-            println!("{}", de.path().display());
-        }
+        path.read_dir()
+            .map_err(|_| Error::ReadDir(path.to_path_buf()))?
+            .filter_map(|de| de.ok())
+            .for_each(|de| println!("{}", de.path().display()));
     }
 
     Ok(())
@@ -193,7 +208,9 @@ pub(crate) fn info(
         .filter_map(|p| aura_core::cache::info(caches, p).ok())
         .flatten()
     {
-        let dt = DateTime::<Local>::from(ci.created).format("%F %T");
+        let dt = OffsetDateTime::from(ci.created).format(format_description!(
+            "[year]-[month]-[day] [hour]-[minute]-[second]"
+        ))?;
         let sig_yes_no = if ci.signature {
             fl!(fll, "common-yes").green().bold()
         } else {
@@ -212,14 +229,14 @@ pub(crate) fn info(
         let pairs: Vec<(&str, ColoredString)> = vec![
             (&name, ci.name.normal()),
             (&ver, format!("{} {}", ci.version.normal(), is_in).normal()),
-            (&created, format!("{}", dt).normal()),
+            (&created, dt.to_string().normal()),
             (&sig, sig_yes_no),
             (&size, format!("{}", ci.size.bytes()).normal()),
             (&av, ci.available.join(", ").normal()),
         ];
 
-        crate::utils::info(&mut w, fll.current_language(), &pairs)?;
-        writeln!(w)?;
+        crate::utils::info(&mut w, fll.current_language(), &pairs).map_err(Error::Stdout)?;
+        writeln!(w).map_err(Error::Stdout)?;
     }
 
     Ok(())
@@ -247,16 +264,14 @@ pub(crate) fn clean(
     yellow!(fll, "C-c-keep", pkgs = keep);
 
     // Proceed if the user accepts.
-    let msg = format!("{} {} ", fl!(fll, "proceed"), fl!(fll, "proceed-yes"));
-    crate::utils::prompt(&a!(msg)).ok_or(Error::Cancelled)?;
+    proceed!(fll, "proceed").ok_or(Error::Cancelled)?;
 
     // Get all the tarball paths, sort and group them by name, and then remove them.
     aura_core::cache::package_paths(caches)
-        .sorted_by(|p0, p1| p1.cmp(&p0)) // Forces a `collect` underneath.
+        .sorted_by(|p0, p1| p1.cmp(p0)) // Forces a `collect` underneath.
         .group_by(|pp| pp.as_package().name.clone()) // TODO Naughty clone.
         .into_iter()
-        .map(|(_, group)| group.skip(keep)) // Thanks to the reverse-sort above, `group` is already backwards.
-        .flatten()
+        .flat_map(|(_, group)| group.skip(keep)) // Thanks to the reverse-sort above, `group` is already backwards.
         .for_each(|pp| {
             let _ = pp.remove(); // TODO Handle this error better?
         });
@@ -268,27 +283,24 @@ pub(crate) fn clean(
 }
 
 /// Delete only those tarballs which aren't present in a snapshot.
-pub(crate) fn clean_not_saved(
-    fll: &FluentLanguageLoader,
-    caches: &[&Path],
-    snapshot_dir: &Path,
-) -> Result<(), Error> {
+pub(crate) fn clean_not_saved(fll: &FluentLanguageLoader, env: &Env) -> Result<(), Error> {
+    let caches = env.caches();
+
     // Report the initial size of the cache.
-    let size_before = aura_core::cache::size(caches);
+    let size_before = aura_core::cache::size(&caches);
     let human = format!("{}", size_before.bytes.bytes());
     aura!(fll, "C-size", size = human);
 
     // Proceed if the user accepts.
-    let msg = format!("{} {} ", fl!(fll, "proceed"), fl!(fll, "proceed-yes"));
-    crate::utils::prompt(&a!(msg)).ok_or(Error::Cancelled)?;
+    proceed!(fll, "proceed").ok_or(Error::Cancelled)?;
 
-    let tarballs = aura_core::cache::package_paths(caches);
+    let tarballs = aura_core::cache::package_paths(&caches);
 
     // Every package across all snapshots, keyed to all unique versions present.
     let snaps: HashMap<String, HashSet<String>> = {
         let mut snaps: HashMap<_, HashSet<_>> = HashMap::new();
 
-        for snap in aura_core::snapshot::snapshots(snapshot_dir) {
+        for snap in aura_core::snapshot::snapshots(&env.backups.snapshots) {
             for (name, ver) in snap.packages.into_iter() {
                 let entry = snaps.entry(name).or_default();
                 entry.insert(ver);
@@ -305,12 +317,12 @@ pub(crate) fn clean_not_saved(
         // from the filesystem.
         match snaps.get(p.name.as_ref()) {
             Some(vs) if vs.contains(p.version.as_ref()) => {}
-            Some(_) | None => tarball.sudo_remove().ok_or(Error::MiscShell)?,
+            Some(_) | None => tarball.sudo_remove().map_err(Error::Delete)?,
         }
     }
 
     // Report the amount of disk space freed.
-    let size_after = aura_core::cache::size(caches);
+    let size_after = aura_core::cache::size(&caches);
     let freed = format!("{}", (size_before.bytes - size_after.bytes).bytes());
     green!(fll, "C-c-freed", bytes = freed);
 
@@ -365,11 +377,13 @@ pub(crate) fn refresh(
         );
 
         // Proceed if the user accepts.
-        let msg = format!("{} {} ", fl!(fll, "proceed"), fl!(fll, "proceed-yes"));
-        crate::utils::prompt(&a!(msg)).ok_or(Error::Cancelled)?;
+        proceed!(fll, "proceed").ok_or(Error::Cancelled)?;
 
         // Determine target cache.
         aura!(fll, "C-y-which-cache");
+        for (i, cache) in caches.iter().enumerate() {
+            println!(" {}) {}", i, cache.display());
+        }
         let ix = crate::utils::select(">>> ", caches.len() - 1)?;
         let target_cache = caches[ix];
 
@@ -449,29 +463,26 @@ fn colour_size(size: i64) -> ColoredString {
 }
 
 /// Backup your package caches to a given directory.
-pub(crate) fn backup(
-    fll: &FluentLanguageLoader,
-    sources: &[&Path],
-    target: &Path,
-) -> Result<(), Error> {
+pub(crate) fn backup(fll: &FluentLanguageLoader, env: &Env, target: &Path) -> Result<(), Error> {
+    let sources = env.caches();
+
     // The full, absolute path to copy files to.
     let full: PathBuf = if target.is_absolute() {
         target.to_path_buf()
     } else {
-        let mut curr = std::env::current_dir()?;
-        curr.push(target);
-        curr
+        std::env::current_dir()
+            .map_err(Error::CurrDir)?
+            .join(target)
     };
     let ts = full.to_str().unwrap();
 
     // Exit early if the target is an existing file, not a directory.
     if target.is_file() {
-        red!(fll, "C-b-file", target = ts);
-        return Err(Error::Silent);
+        return Err(Error::AlreadyExists(target.to_path_buf()));
     }
 
     // How big is the current cache?
-    let cache_size: CacheSize = aura_core::cache::size(sources);
+    let cache_size: CacheSize = aura_core::cache::size(&sources);
     let size = format!("{}", cache_size.bytes.bytes());
     aura!(fll, "C-size", size = size);
 
@@ -484,9 +495,9 @@ pub(crate) fn backup(
     }
 
     // Proceed if the user accepts.
-    let msg = format!("{} {} ", fl!(fll, "proceed"), fl!(fll, "proceed-yes"));
-    crate::utils::prompt(&a!(msg)).ok_or(Error::Cancelled)?;
-    copy(sources, &full, cache_size.files)
+    proceed!(fll, "proceed").ok_or(Error::Cancelled)?;
+
+    copy(&sources, &full, cache_size.files)
 }
 
 /// Copy all the cache files concurrently.
@@ -499,9 +510,9 @@ fn copy(sources: &[&Path], target: &Path, file_count: usize) -> Result<(), Error
     let bar = pb.lock().unwrap().bar(file_count, "File Copying"); // TODO Localize.
 
     // Silently succeeds if the directory already exists.
-    std::fs::create_dir_all(target)?;
+    std::fs::create_dir_all(target).map_err(|e| Error::Mkdir(target.to_path_buf(), e))?;
 
-    aura_core::common::read_dirs(sources)
+    aura_core::read_dirs(sources)
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let from = entry.path();

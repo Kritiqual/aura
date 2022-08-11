@@ -1,6 +1,6 @@
 //! Cache manipulation internals.
 
-use crate::common::Package;
+use crate::Package;
 use alpm::Alpm;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -64,14 +64,11 @@ impl<'a> PkgPath<'a> {
 
     // TODO I'd like it if this could be avoided.
     /// Remove this via a shell call to `rm`.
-    pub fn sudo_remove(self) -> Option<()> {
-        Command::new("sudo")
-            .arg("rm")
-            .arg(self.path)
-            .status()
-            .ok()?
-            .success()
-            .then(|| ())
+    pub fn sudo_remove(self) -> Result<(), PathBuf> {
+        match Command::new("sudo").arg("rm").arg(&self.path).status() {
+            Ok(s) if s.success() => Ok(()),
+            Ok(_) | Err(_) => Err(self.path),
+        }
     }
 }
 
@@ -117,10 +114,15 @@ pub fn search<'a, P>(caches: &'a [P], term: &'a str) -> impl Iterator<Item = Pat
 where
     P: AsRef<Path>,
 {
-    crate::common::read_dirs(caches)
+    crate::read_dirs(caches)
         .filter_map(|r| r.ok())
         .map(|de| de.path())
-        .filter(move |path| path.to_str().map(|s| s.contains(term)).unwrap_or(false))
+        .filter(move |path| {
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.contains(term))
+                .unwrap_or(false)
+        })
 }
 
 /// Yield the [`CacheInfo`], if possible, of the given packages.
@@ -166,7 +168,7 @@ pub fn size<P>(paths: &[P]) -> CacheSize
 where
     P: AsRef<Path>,
 {
-    let (files, bytes) = crate::common::read_dirs(paths)
+    let (files, bytes) = crate::read_dirs(paths)
         .filter_map(|de| de.ok())
         .filter(|de| is_package(&de.path()))
         .filter_map(|de| de.metadata().ok())
@@ -181,7 +183,7 @@ pub fn package_paths<P>(caches: &[P]) -> impl Iterator<Item = PkgPath<'static>> 
 where
     P: AsRef<Path>,
 {
-    crate::common::read_dirs(caches)
+    crate::read_dirs(caches)
         .filter_map(|r| r.ok())
         .map(|de| de.path())
         .filter_map(PkgPath::new)
@@ -203,12 +205,28 @@ pub fn officials_missing_tarballs<'a>(
     })
 }
 
+/// Installed foreign packages that have no tarball in the cache.
+pub fn foreigns_missing_tarballs<'a>(
+    alpm: &'a Alpm,
+    caches: &[&Path],
+) -> impl Iterator<Item = alpm::Package<'a>> {
+    let groups = all_versions(caches);
+
+    aura_arch::foreigns(alpm).filter(move |p| {
+        let pv = p.version().as_str();
+        groups
+            .get(p.name())
+            .map(|vs| !vs.contains(pv))
+            .unwrap_or(true)
+    })
+}
+
 /// Installed packages that have no tarball in the cache.
 pub fn missing_tarballs<'a>(
     alpm: &'a Alpm,
     caches: &[&Path],
 ) -> impl Iterator<Item = alpm::Package<'a>> {
-    let groups = all_versions(caches);
+    let groups: HashMap<String, HashSet<String>> = all_versions(caches);
 
     alpm.localdb().pkgs().into_iter().filter(move |p| {
         let pv = p.version().as_str();

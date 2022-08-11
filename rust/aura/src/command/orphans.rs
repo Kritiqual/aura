@@ -1,61 +1,65 @@
 //! All functionality involving the `-O` command.
 
-use crate::{a, green, yellow};
+use crate::error::Nested;
+use crate::localization::Localised;
+use crate::{green, proceed, yellow};
 use alpm::{Alpm, PackageReason, TransFlag};
 use aura_arch as arch;
 use colored::*;
+use from_variants::FromVariants;
 use i18n_embed::fluent::FluentLanguageLoader;
 use i18n_embed_fl::fl;
+use log::error;
 use std::collections::HashSet;
 use ubyte::ToByteUnit;
 
-pub enum Error {
-    Alpm(alpm::Error),
+#[derive(FromVariants)]
+pub(crate) enum Error {
+    #[from_variants(skip)]
+    SetExplicit(String, alpm::Error),
     Readline(rustyline::error::ReadlineError),
     Sudo(crate::utils::SudoError),
+    #[from_variants(skip)]
+    AlpmTx(alpm::Error),
     Cancelled,
     NoneExist,
 }
 
-impl From<crate::utils::SudoError> for Error {
-    fn from(v: crate::utils::SudoError) -> Self {
-        Self::Sudo(v)
-    }
-}
-
-impl From<rustyline::error::ReadlineError> for Error {
-    fn from(v: rustyline::error::ReadlineError) -> Self {
-        Self::Readline(v)
-    }
-}
-
-impl From<alpm::Error> for Error {
-    fn from(v: alpm::Error) -> Self {
-        Self::Alpm(v)
-    }
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Nested for Error {
+    fn nested(&self) {
         match self {
-            Error::Alpm(e) => write!(f, "{}", e),
-            Error::Readline(e) => write!(f, "{}", e),
-            Error::Sudo(e) => write!(f, "{}", e),
-            Error::NoneExist => write!(f, "No such packages exist."),
-            Error::Cancelled => write!(f, "Action cancelled."),
+            Error::SetExplicit(_, e) => error!("{e}"),
+            Error::Readline(e) => error!("{e}"),
+            Error::Sudo(e) => e.nested(),
+            Error::AlpmTx(e) => error!("{e}"),
+            Error::Cancelled => {}
+            Error::NoneExist => {}
+        }
+    }
+}
+
+impl Localised for Error {
+    fn localise(&self, fll: &FluentLanguageLoader) -> String {
+        match self {
+            Error::Readline(_) => fl!(fll, "err-user-input"),
+            Error::Sudo(e) => e.localise(fll),
+            Error::Cancelled => fl!(fll, "common-cancelled"),
+            Error::NoneExist => fl!(fll, "err-none-exist"),
+            Error::SetExplicit(p, _) => fl!(fll, "O-explicit-err", pkg = p.as_str()),
+            Error::AlpmTx(_) => fl!(fll, "alpm-tx"),
         }
     }
 }
 
 /// Print the name of each orphaned package.
 pub(crate) fn list(alpm: &Alpm) {
-    arch::orphans(&alpm).for_each(|o| println!("{}", o.name()))
+    arch::orphans(alpm).for_each(|o| println!("{} {}", o.name(), o.version()))
 }
 
 /// Sets a package's install reason to "as explicit". An alias for `-D --asexplicit`.
 pub(crate) fn adopt(
     alpm: &Alpm,
-    fll: FluentLanguageLoader,
+    fll: &FluentLanguageLoader,
     packages: Vec<String>,
 ) -> Result<(), Error> {
     crate::utils::sudo()?;
@@ -72,8 +76,9 @@ pub(crate) fn adopt(
     }
 
     for mut p in reals {
-        p.set_reason(PackageReason::Explicit)?;
-        green!(fll, "O-adopt", package = p.name());
+        p.set_reason(PackageReason::Explicit)
+            .map_err(|e| Error::SetExplicit(p.name().to_string(), e))?;
+        green!(fll, "O-adopt", pkg = p.name());
     }
 
     Ok(())
@@ -83,7 +88,7 @@ pub(crate) fn adopt(
 ///
 /// Will fail if the process does not have permission to create the lockfile,
 /// which usually lives in a root-owned directory.
-pub(crate) fn remove(alpm: &mut Alpm, fll: FluentLanguageLoader) -> Result<(), Error> {
+pub(crate) fn remove(alpm: &mut Alpm, fll: &FluentLanguageLoader) -> Result<(), Error> {
     crate::utils::sudo()?;
 
     // Check for orphans.
@@ -95,14 +100,14 @@ pub(crate) fn remove(alpm: &mut Alpm, fll: FluentLanguageLoader) -> Result<(), E
         // Initialize the transaction.
         let mut flag = TransFlag::RECURSE;
         flag.insert(TransFlag::UNNEEDED);
-        alpm.trans_init(flag)?;
+        alpm.trans_init(flag).map_err(Error::AlpmTx)?;
 
         for p in orphans {
-            alpm.trans_remove_pkg(p)?;
+            alpm.trans_remove_pkg(p).map_err(Error::AlpmTx)?;
         }
 
         // Advance the transaction, calculating the effects of the TransFlags.
-        alpm.trans_prepare().map_err(|(_, e)| Error::Alpm(e))?;
+        alpm.trans_prepare().map_err(|(_, e)| Error::AlpmTx(e))?;
 
         // Notify the user of the results.
         let removal = alpm.trans_remove();
@@ -124,10 +129,10 @@ pub(crate) fn remove(alpm: &mut Alpm, fll: FluentLanguageLoader) -> Result<(), E
         println!("  {:w$} {:>9}\n", "Total", size, w = longest);
 
         // Proceed with the removal if the user accepts.
-        let msg = format!("{} {} ", fl!(fll, "proceed"), fl!(fll, "proceed-yes"));
-        crate::utils::prompt(&a!(msg)).ok_or(Error::Cancelled)?;
-        alpm.trans_commit().map_err(|(_, e)| Error::Alpm(e))?;
-        alpm.trans_release()?;
+        proceed!(fll, "proceed").ok_or(Error::Cancelled)?;
+
+        alpm.trans_commit().map_err(|(_, e)| Error::AlpmTx(e))?;
+        alpm.trans_release().map_err(Error::AlpmTx)?;
         green!(fll, "common-done");
     }
 

@@ -1,13 +1,37 @@
 //! Statistics about the user's machine or about Aura itself.
 
-use crate::error::Error;
-use crate::localization;
+use crate::error::Nested;
+use crate::localization::{self, Localised};
 use alpm::Alpm;
 use colored::*;
+use from_variants::FromVariants;
+use i18n_embed::fluent::FluentLanguageLoader;
 use i18n_embed_fl::fl;
+use log::error;
 use std::collections::{HashMap, HashSet};
 use ubyte::ToByteUnit;
 use unic_langid::{langid, LanguageIdentifier};
+
+#[derive(FromVariants)]
+pub(crate) enum Error {
+    LangLoad(i18n_embed::I18nEmbedError),
+}
+
+impl Nested for Error {
+    fn nested(&self) {
+        match self {
+            Error::LangLoad(e) => error!("{e}"),
+        }
+    }
+}
+
+impl Localised for Error {
+    fn localise(&self, fll: &FluentLanguageLoader) -> String {
+        match self {
+            Error::LangLoad(_) => fl!(fll, "stats-local"),
+        }
+    }
+}
 
 /// Raw contents of loaded localizations.
 pub(crate) fn localization() -> Result<(), Error> {
@@ -42,7 +66,7 @@ pub(crate) fn localization() -> Result<(), Error> {
         };
         let pad = long - visual_len(&lang, &n);
         println!(
-            "{} [{}]{:w$} {:02}/{} ({:.2}%)",
+            "{} [{}]{:w$} {:03}/{} ({:.2}%)",
             l,
             n,
             "",

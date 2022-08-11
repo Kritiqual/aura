@@ -1,10 +1,18 @@
 //! Various utility functions.
 
+use crate::error::Nested;
+use crate::localization::Localised;
 use colored::{ColoredString, Colorize};
+use i18n_embed_fl::fl;
 use rustyline::Editor;
 use std::io::Write;
+use std::iter::Peekable;
+use std::path::Path;
 use std::str::FromStr;
 use unic_langid::LanguageIdentifier;
+
+/// An empty array to satisfy typechecking in a few places around the codebase.
+pub(crate) const NOTHING: [&str; 0] = [];
 
 /// Injection of the `void` method into [`Result`], which is a common shorthand
 /// for "forgetting" the internal return value of a `Result`. Note that this
@@ -29,6 +37,20 @@ impl<T, E, R> ResultVoid<E, R> for Result<T, E> {
             Ok(_) => Ok(()),
             Err(e) => Err(From::from(e)),
         }
+    }
+}
+
+/// Produce a proper UTF-8 `String` from a `Path`-like type.
+pub(crate) trait PathStr {
+    fn utf8(&self) -> String;
+}
+
+impl<T> PathStr for T
+where
+    T: AsRef<Path>,
+{
+    fn utf8(&self) -> String {
+        self.as_ref().display().to_string()
     }
 }
 
@@ -88,15 +110,75 @@ pub(crate) fn select(msg: &str, max: usize) -> Result<usize, rustyline::error::R
     }
 }
 
-pub struct SudoError;
+pub(crate) struct SudoError;
 
-impl std::fmt::Display for SudoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Failed to raise privileges.")
+impl Nested for SudoError {
+    fn nested(&self) {}
+}
+
+impl Localised for SudoError {
+    fn localise(&self, fll: &i18n_embed::fluent::FluentLanguageLoader) -> String {
+        fl!(fll, "err-sudo")
     }
 }
 
 /// Escalate the privileges of the Aura process, if necessary.
 pub(crate) fn sudo() -> Result<(), SudoError> {
     sudo::escalate_if_needed().map_err(|_| SudoError).void()
+}
+
+/// An [`Iterator`] that knows if the current iteration step is the last one.
+/// Utilizes [`Peekable`] under the hood, so note that this forces the iteration
+/// of the next element.
+pub(crate) struct Finished<I>
+where
+    I: Iterator,
+{
+    iter: Peekable<I>,
+}
+
+impl<I> Finished<I>
+where
+    I: Iterator,
+{
+    /// Construct a new `Marked` iterator.
+    pub(crate) fn new(iter: I) -> Self {
+        Finished {
+            iter: iter.peekable(),
+        }
+    }
+}
+
+impl<I> Iterator for Finished<I>
+where
+    I: Iterator,
+{
+    type Item = Iteration<I::Item>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.iter.next() {
+            Some(t) if self.iter.peek().is_none() => Some(Iteration::Final(t)),
+            Some(t) => Some(Iteration::Middle(t)),
+            None => None,
+        }
+    }
+}
+
+/// How far along an iteration are we?
+pub(crate) enum Iteration<T> {
+    Middle(T),
+    Final(T),
+}
+
+impl<T> Iteration<T> {
+    pub(crate) fn inner(self) -> T {
+        match self {
+            Iteration::Middle(t) => t,
+            Iteration::Final(t) => t,
+        }
+    }
+
+    pub(crate) fn is_last(&self) -> bool {
+        matches!(self, Iteration::Final(_))
+    }
 }

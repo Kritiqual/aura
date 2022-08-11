@@ -1,6 +1,6 @@
 cabal-version:      2.2
 name:               aura
-version:            3.2.7
+version:            3.2.9
 synopsis:           A secure package manager for Arch Linux and the AUR.
 description:
   Aura is a package manager for Arch Linux. It connects to both the
@@ -29,7 +29,7 @@ extra-source-files:
   test/bad.PKGBUILD
 
 common commons
-  default-language:   Haskell2010
+  default-language:   GHC2021
   default-extensions:
     NoImplicitPrelude
     OverloadedStrings
@@ -41,7 +41,7 @@ common commons
 
   build-depends:
     , base        >=4.12   && <5
-    , bytestring  ^>=0.10
+    , bytestring  ^>=0.11
     , containers  ^>=0.6
     , megaparsec  >=7      && <10
     , rio         ^>=0.1.17
@@ -50,7 +50,7 @@ common commons
 
 common libexec
   build-depends:
-    , aeson                        ^>=2.0
+    , aeson                        >=2.1 && < 2.3
     , aur                          ^>=7.0.5
     , http-client                  >=0.5 && <0.8
     , prettyprinter                >=1.2 && <1.8
@@ -58,6 +58,7 @@ common libexec
     , scheduler                    >=1.1 && <2.1
     , transformers                 ^>=0.5
     , typed-process                ^>=0.2
+    , unix                         ^>=2.7.2.2
 
 library
   import:          commons, libexec
@@ -89,14 +90,14 @@ library
     Aura.Utils
 
   build-depends:
-    , algebraic-graphs  >=0.1 && <0.7
+    , algebraic-graphs  >=0.1 && <0.8
     , filepath          ^>=1.4
     , hashable          ^>=1.4
     , http-types        >=0.9 && <0.13
     , language-bash     >=0.8 && <0.10
     , network-uri       ^>=2.6
     , stm               ^>=2.5
-    , time              >=1.8 && <1.10
+    , time              >=1.8 && <1.12
 
 executable aura
   import:         commons, libexec

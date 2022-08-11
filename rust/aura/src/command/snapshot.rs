@@ -1,68 +1,71 @@
 //! All functionality involving the `-B` command.
 
-use crate::{a, aura, green, red};
+use crate::error::Nested;
+use crate::localization::Localised;
+use crate::utils::{PathStr, NOTHING};
+use crate::{aura, green, proceed};
 use alpm::Alpm;
 use aura_core::snapshot::Snapshot;
 use colored::*;
+use from_variants::FromVariants;
 use i18n_embed::fluent::FluentLanguageLoader;
 use i18n_embed_fl::fl;
+use log::error;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufWriter;
 use std::ops::Not;
-use std::path::Path;
-use std::{cmp::Ordering, ffi::OsStr};
+use std::path::{Path, PathBuf};
+use time::macros::format_description;
 
-pub enum Error {
-    Io(std::io::Error),
+#[derive(FromVariants)]
+pub(crate) enum Error {
     Dirs(crate::dirs::Error),
     Pacman(crate::pacman::Error),
     Readline(rustyline::error::ReadlineError),
-    Json(serde_json::Error),
+    #[from_variants(skip)]
+    JsonWrite(PathBuf, serde_json::Error),
+    #[from_variants(skip)]
+    DeleteFile(PathBuf, std::io::Error),
+    #[from_variants(skip)]
+    OpenFile(PathBuf, std::io::Error),
+    TimeLocal(time::error::IndeterminateOffset),
+    TimeFormat(time::error::Format),
     Cancelled,
-    Silent,
+    NoSnapshots,
 }
 
-impl From<crate::pacman::Error> for Error {
-    fn from(v: crate::pacman::Error) -> Self {
-        Self::Pacman(v)
-    }
-}
-
-impl From<serde_json::Error> for Error {
-    fn from(v: serde_json::Error) -> Self {
-        Self::Json(v)
-    }
-}
-
-impl From<crate::dirs::Error> for Error {
-    fn from(v: crate::dirs::Error) -> Self {
-        Self::Dirs(v)
-    }
-}
-
-impl From<rustyline::error::ReadlineError> for Error {
-    fn from(v: rustyline::error::ReadlineError) -> Self {
-        Self::Readline(v)
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(v: std::io::Error) -> Self {
-        Self::Io(v)
-    }
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Nested for Error {
+    fn nested(&self) {
         match self {
-            Error::Io(e) => write!(f, "{}", e),
-            Error::Dirs(e) => write!(f, "{}", e),
-            Error::Pacman(e) => write!(f, "{}", e),
-            Error::Readline(e) => write!(f, "{}", e),
-            Error::Json(e) => write!(f, "{}", e),
-            Error::Silent => write!(f, ""),
-            Error::Cancelled => write!(f, "Action cancelled."),
+            Error::Dirs(e) => e.nested(),
+            Error::Pacman(e) => e.nested(),
+            Error::Readline(e) => error!("{e}"),
+            Error::JsonWrite(_, e) => error!("{e}"),
+            Error::DeleteFile(_, e) => error!("{e}"),
+            Error::OpenFile(_, e) => error!("{e}"),
+            Error::Cancelled => {}
+            Error::NoSnapshots => {}
+            Error::TimeLocal(e) => error!("{e}"),
+            Error::TimeFormat(e) => error!("{e}"),
+        }
+    }
+}
+
+impl Localised for Error {
+    fn localise(&self, fll: &FluentLanguageLoader) -> String {
+        match self {
+            Error::Dirs(e) => e.localise(fll),
+            Error::Pacman(e) => e.localise(fll),
+            Error::Readline(_) => fl!(fll, "err-user-input"),
+            Error::JsonWrite(p, _) => fl!(fll, "err-json-write", file = p.utf8()),
+            Error::Cancelled => fl!(fll, "common-cancelled"),
+            Error::NoSnapshots => fl!(fll, "B-none"),
+            Error::DeleteFile(p, _) => fl!(fll, "err-file-del", file = p.utf8()),
+            Error::OpenFile(p, _) => fl!(fll, "err-file-open", file = p.utf8()),
+            Error::TimeLocal(_) => fl!(fll, "err-time-local"),
+            Error::TimeFormat(_) => fl!(fll, "err-time-format"),
         }
     }
 }
@@ -78,30 +81,32 @@ struct StateDiff<'a> {
     to_remove: HashSet<&'a str>,
 }
 
-pub(crate) fn save(fll: &FluentLanguageLoader, alpm: &Alpm) -> Result<(), Error> {
-    let mut cache = crate::dirs::snapshot()?;
-    let snap = Snapshot::from_alpm(alpm);
-    let name = format!("{}.json", snap.time.format("%Y.%m(%b).%d.%H.%M.%S"));
-    cache.push(name);
+pub(crate) fn save(fll: &FluentLanguageLoader, alpm: &Alpm, snapshots: &Path) -> Result<(), Error> {
+    let snap = Snapshot::from_alpm(alpm)?;
+    let form =
+        format_description!("[year].[month]([month repr:short]).[day].[hour].[minute].[second]");
+    let name = format!("{}.json", snap.time.format(form)?);
+    let path = snapshots.join(name);
 
-    let file = BufWriter::new(File::create(cache)?);
-    serde_json::to_writer(file, &snap)?;
+    let file = BufWriter::new(File::create(&path).map_err(|e| Error::OpenFile(path.clone(), e))?);
+    serde_json::to_writer(file, &snap).map_err(|e| Error::JsonWrite(path, e))?;
     green!(fll, "B-saved");
 
     Ok(())
 }
 
 /// Remove all saveds snapshots that don't have tarballs in the cache.
-pub(crate) fn clean(fll: &FluentLanguageLoader, caches: &[&Path]) -> Result<(), Error> {
-    let msg = format!("{} {} ", fl!(fll, "B-clean"), fl!(fll, "proceed-yes"));
-    crate::utils::prompt(&a!(msg)).ok_or(Error::Cancelled)?;
-
-    let path = crate::dirs::snapshot()?;
+pub(crate) fn clean(
+    fll: &FluentLanguageLoader,
+    caches: &[&Path],
+    snapshots: &Path,
+) -> Result<(), Error> {
+    proceed!(fll, "B-clean").ok_or(Error::Cancelled)?;
     let vers = aura_core::cache::all_versions(caches);
 
-    for (path, snapshot) in aura_core::snapshot::snapshots_with_paths(&path) {
+    for (path, snapshot) in aura_core::snapshot::snapshots_with_paths(snapshots) {
         if snapshot.pinned.not() && snapshot.usable(&vers).not() {
-            std::fs::remove_file(path)?;
+            std::fs::remove_file(&path).map_err(|e| Error::DeleteFile(path, e))?;
         }
     }
 
@@ -110,10 +115,8 @@ pub(crate) fn clean(fll: &FluentLanguageLoader, caches: &[&Path]) -> Result<(), 
 }
 
 /// Show all saved package snapshot filenames.
-pub(crate) fn list() -> Result<(), Error> {
-    let snap = crate::dirs::snapshot()?;
-
-    for (path, _) in aura_core::snapshot::snapshots_with_paths(&snap) {
+pub(crate) fn list(snapshots: &Path) -> Result<(), Error> {
+    for (path, _) in aura_core::snapshot::snapshots_with_paths(snapshots) {
         println!("{}", path.display());
     }
 
@@ -124,24 +127,24 @@ pub(crate) fn restore(
     fll: &FluentLanguageLoader,
     alpm: &Alpm,
     caches: &[&Path],
+    snapshots: &Path,
 ) -> Result<(), Error> {
-    let snap = crate::dirs::snapshot()?;
     let vers = aura_core::cache::all_versions(caches);
 
-    let mut shots: Vec<_> = aura_core::snapshot::snapshots(&snap)
+    let mut shots: Vec<_> = aura_core::snapshot::snapshots(snapshots)
         .filter(|ss| ss.usable(&vers))
         .collect();
     shots.sort_by_key(|ss| ss.time);
     let digits = 1 + (shots.len() / 10);
 
     if shots.is_empty() {
-        red!(fll, "B-none");
-        return Err(Error::Silent);
+        return Err(Error::NoSnapshots);
     }
 
     aura!(fll, "B-select");
     for (i, ss) in shots.iter().enumerate() {
-        let time = ss.time.format("%Y %B %d %T");
+        let form = format_description!("[year]-[month]-[day] [hour]-[minute]-[second]");
+        let time = ss.time.format(form)?;
         let pinned = ss.pinned.then(|| "[pinned]".cyan()).unwrap_or_default();
         println!(" {:w$}) {} {}", i, time, pinned, w = digits);
     }
@@ -175,14 +178,12 @@ fn restore_snapshot(alpm: &Alpm, caches: &[&Path], snapshot: Snapshot) -> Result
             })
             .map(|pp| pp.into_pathbuf().into_os_string());
 
-        crate::pacman::sudo_pacman(
-            std::iter::once(OsStr::new("-U").to_os_string()).chain(tarballs),
-        )?;
+        crate::pacman::sudo_pacman("-U", NOTHING, tarballs)?;
     }
 
     // Remove packages that weren't installed within the chosen snapshot.
     if diff.to_remove.is_empty().not() {
-        crate::pacman::sudo_pacman(std::iter::once("-R").chain(diff.to_remove))?;
+        crate::pacman::sudo_pacman("-R", NOTHING, diff.to_remove)?;
     }
 
     Ok(())

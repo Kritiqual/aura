@@ -3,12 +3,16 @@ members = [
 # The executable
 "aura",
 # Core libraries
-"aura-core", "aura-arch", "aura-common",
+"aura-core", "aura-arch",
 # Ecosystem libraries
-"raur-curl", "r2d2-alpm"
+"r2d2-alpm",
+# Documentation Generation
+"doc-gen"
 ]
 
 [profile.release]
 lto = true
 panic = "abort"
-# opt-level = "z"  # Reduces final stripped size by ~20%.
+strip = true
+opt-level = "z"  # Reduces final stripped size by ~20%.
+codegen-units = 1

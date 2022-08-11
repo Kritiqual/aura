@@ -3,24 +3,41 @@
 pub mod dependencies;
 
 use log::debug;
-use raur_curl::Raur;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 /// The base path of the URL.
 pub const AUR_BASE_URL: &str = "https://aur.archlinux.org/";
 
-/// AUR package information.
-pub fn info<S>(packages: &[S]) -> Result<Vec<raur_curl::Package>, raur_curl::Error>
-where
-    S: AsRef<str>,
-{
-    raur_curl::Handle::new().info(packages)
+/// Errors in handling AUR packages.
+pub enum Error {
+    /// Some problem involving pulling or cloning.
+    Git(crate::git::Error),
+    /// Calling the Faur failed somehow.
+    FaurFetch(String),
+    /// A package exists in no way on the AUR.
+    PackageDoesNotExist(String),
+    /// Somehow the Faur returned too many results.
+    TooManyFaurResults(String),
 }
 
-/// Search the AUR for packages matching a query.
-pub fn search(query: &str) -> Result<Vec<raur_curl::Package>, raur_curl::Error> {
-    raur_curl::Handle::new().search(query)
+impl From<crate::git::Error> for Error {
+    fn from(v: crate::git::Error) -> Self {
+        Self::Git(v)
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Git(e) => write!(f, "{e}"),
+            Error::FaurFetch(p) => write!(f, "Calling the Faur utterly failed: {p}"),
+            Error::PackageDoesNotExist(p) => write!(f, "Unknown package: {p}"),
+            Error::TooManyFaurResults(p) => {
+                write!(f, "More results returned from Faur than expected: {p}")
+            }
+        }
+    }
 }
 
 /// The result of inspecting the existance status of a collection of package
@@ -37,18 +54,20 @@ pub struct PkgPartition<'a> {
 /// Given a [`Path`] to an expected directory of AUR package repo clones, check
 /// it and the AUR to determine which of a given collection of packages are
 /// actually real.
-pub fn partition_aur_pkgs<'a, S>(
-    clone_dir: &Path,
+pub fn partition_aur_pkgs<'a, S, F, E>(
+    fetch: &F,
+    clone_d: &Path,
     packages: &'a [S],
-) -> Result<PkgPartition<'a>, raur_curl::Error>
+) -> Result<PkgPartition<'a>, E>
 where
     S: AsRef<str>,
+    F: Fn(&str) -> Result<Vec<crate::faur::Package>, E>,
 {
     let (cloned, fast_bads): (Vec<Cow<'a, str>>, Vec<Cow<'a, str>>) = packages
         .iter()
         .map(|p| Cow::Borrowed(p.as_ref()))
-        .partition(|p| is_aur_package_fast(clone_dir, p));
-    let mut part = partition_real_pkgs_via_aur(clone_dir, fast_bads)?;
+        .partition(|p| has_local_aur_clone(clone_d, p));
+    let mut part = partition_real_pkgs_via_aur(fetch, clone_d, fast_bads)?;
 
     part.cloned.extend(cloned);
     Ok(part)
@@ -59,23 +78,25 @@ where
 ///
 /// This of course isn't fool proof, since it doesn't consult the AUR, and thus
 /// the caller should follow up with an AUR call if this returns `false`.
-fn is_aur_package_fast(clone_dir: &Path, package: &str) -> bool {
-    let mut path = clone_dir.to_path_buf();
-    path.push(package);
-    path.is_dir()
+pub fn has_local_aur_clone(clone_d: &Path, pkg: &str) -> bool {
+    clone_d.join(pkg).is_dir()
 }
 
 // TODO Tue Jan 18 20:13:12 2022
 //
 // If this is ever made `pub`, switch it to a generic `S: AsRef<str>`.
 /// Performs an AUR `info` call to determine which packages are real or not.
-fn partition_real_pkgs_via_aur<'a>(
-    clone_dir: &Path,
+fn partition_real_pkgs_via_aur<'a, F, E>(
+    fetch: &F,
+    clone_d: &Path,
     packages: Vec<Cow<'a, str>>,
-) -> Result<PkgPartition<'a>, raur_curl::Error> {
+) -> Result<PkgPartition<'a>, E>
+where
+    F: Fn(&str) -> Result<Vec<crate::faur::Package>, E>,
+{
     debug!("AUR call to check for: {:?}", packages);
 
-    let info: Vec<_> = info(&packages)?;
+    let info: Vec<_> = crate::faur::info(packages.iter().map(|cow| cow.as_ref()), fetch)?;
 
     // First we need to determine which of the AUR-returned packages were
     // actually "split" packages (i.e. those built as a child of another, like
@@ -86,7 +107,7 @@ fn partition_real_pkgs_via_aur<'a>(
     // clones, so we need to recheck those.
     let (pkgbase_cloned, pkgbase_to_clone): (Vec<_>, _) = splits
         .into_iter()
-        .partition(|p| is_aur_package_fast(clone_dir, &p.package_base));
+        .partition(|p| has_local_aur_clone(clone_d, &p.package_base));
 
     // Anything else must not really exist.
     let not_real = packages
@@ -130,4 +151,34 @@ pub fn clone_aur_repo(root: Option<&Path>, package: &str) -> Result<PathBuf, cra
     };
 
     crate::git::shallow_clone(&url, &clone_path).map(|_| clone_path)
+}
+
+/// Yield a path to the local git clone of the given package. The path won't
+/// exactly match the original name of the package when it wasn't the original
+/// `pkgbase` (example: gcc6-libs -> gcc6).
+///
+/// Either way, if there was no local clone present, this will cause a `git
+/// clone` to occur.
+pub fn clone_path_of_pkgbase<F, E>(clone_d: &Path, pkg: &str, fetch: &F) -> Result<PathBuf, Error>
+where
+    F: Fn(&str) -> Result<Vec<crate::faur::Package>, E>,
+{
+    let path: PathBuf = if has_local_aur_clone(clone_d, pkg) {
+        clone_d.join(pkg)
+    } else {
+        let ps = crate::faur::info([pkg], fetch).map_err(|_| Error::FaurFetch(pkg.to_string()))?;
+        let fp = match ps.as_slice() {
+            [fp] => Ok(fp),
+            [] => Err(Error::PackageDoesNotExist(pkg.to_string())),
+            [_, _, ..] => Err(Error::TooManyFaurResults(pkg.to_string())),
+        }?;
+
+        if has_local_aur_clone(clone_d, &fp.package_base) {
+            clone_d.join(&fp.package_base)
+        } else {
+            clone_aur_repo(Some(clone_d), &fp.package_base)?
+        }
+    };
+
+    Ok(path)
 }
